@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SageMaker AI Agent Demo - Provisions a SageMaker Notebook instance with
+  Claude Code (Bedrock, Opus 4.6) and the Titanic dataset pre-loaded.
+
+Parameters:
+  NotebookInstanceType:
+    Type: String
+    Default: ml.t3.medium
+    Description: SageMaker Notebook instance type
+    AllowedValues:
+      - ml.t3.medium
+      - ml.t3.large
+      - ml.t3.xlarge
+      - ml.m5.xlarge
+
+  VolumeSizeGB:
+    Type: Number
+    Default: 20
+    Description: EBS volume size in GB for the notebook instance
+
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region where Bedrock Opus 4.6 model access is enabled
+
+Resources:
+
+  NotebookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-NotebookRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListInferenceProfiles
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+
+  NotebookLifecycleConfig:
+    Type: AWS::SageMaker::NotebookInstanceLifecycleConfig
+    Properties:
+      NotebookInstanceLifecycleConfigName: !Sub '${AWS::StackName}-OnCreate'
+      OnCreate:
+        - Content:
+            Fn::Base64: !Sub |
+              #!/bin/bash
+              set -e
+
+              # Download Titanic dataset (fast — small CSV)
+              mkdir -p /home/ec2-user/SageMaker/data
+              wget -q "https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv" \
+                -O /home/ec2-user/SageMaker/data/titanic.csv
+              chown -R ec2-user:ec2-user /home/ec2-user/SageMaker/data
+
+              # Install Anthropic SDK and data science libs into the Jupyter conda env
+              sudo -u ec2-user bash -c 'source /home/ec2-user/anaconda3/bin/activate python3 && pip install anthropic[bedrock] matplotlib seaborn scikit-learn joblib sagemaker pandas numpy --quiet'
+
+              # Create %%claude Jupyter magic module
+              mkdir -p /home/ec2-user/SageMaker/claude_magic
+              cat > /home/ec2-user/SageMaker/claude_magic/__init__.py << 'MAGICEOF'
+              from .magic import ClaudeMagic
+
+              def load_ipython_extension(ipython):
+                  ipython.register_magics(ClaudeMagic)
+              MAGICEOF
+
+              cat > /home/ec2-user/SageMaker/claude_magic/magic.py << 'MAGICPYEOF'
+              import re
+              import os
+              from IPython.core.magic import Magics, magics_class, cell_magic
+              from IPython.display import display, Markdown
+              from anthropic import AnthropicBedrock
+
+              @magics_class
+              class ClaudeMagic(Magics):
+                  def __init__(self, shell):
+                      super().__init__(shell)
+                      self.client = AnthropicBedrock(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
+                      self.model = "us.anthropic.claude-opus-4-6-v1"
+                      self.history = []
+                      # Ensure working directory is SageMaker home
+                      os.chdir('/home/ec2-user/SageMaker')
+
+                  @cell_magic
+                  def claude(self, line, cell):
+                      """Send a prompt to Claude and execute the returned code."""
+                      prompt = cell.strip()
+                      if not prompt:
+                          print("Usage: %%claude\\nYour prompt here")
+                          return
+
+                      # Build context from notebook variables
+                      user_ns = self.shell.user_ns
+                      context_vars = {k: str(type(v).__name__) for k, v in user_ns.items()
+                                      if not k.startswith('_') and k not in ('In', 'Out', 'get_ipython', 'exit', 'quit')}
+
+                      system_msg = (
+                          "You are an AI assistant running inside a Jupyter notebook on a SageMaker instance. "
+                          "The user asks you to perform data science tasks. "
+                          "IMPORTANT RULES:\n"
+                          "- Respond with a SINGLE ```python code block that can be executed directly.\n"
+                          "- You can use the SageMaker SDK to launch training jobs on separate instances when appropriate.\n"
+                          "- Use scikit-learn, pandas, matplotlib, seaborn for local tasks and data prep.\n"
+                          "- Do NOT split code into multiple cells or steps — one block only.\n"
+                          "- You can include a brief explanation before the code block.\n"
+                          f"Available variables in the notebook: {context_vars}\n"
+                          "Working directory: /home/ec2-user/SageMaker\n"
+                          "The Titanic dataset is at ./data/titanic.csv\n"
+                          "All file writes must use paths under /home/ec2-user/SageMaker/ (e.g. ./data/, ./models/, ./plots/)"
+                      )
+
+                      self.history.append({"role": "user", "content": prompt})
+
+                      response = self.client.messages.create(
+                          model=self.model,
+                          max_tokens=4096,
+                          system=system_msg,
+                          messages=self.history
+                      )
+
+                      reply = response.content[0].text
+                      self.history.append({"role": "assistant", "content": reply})
+
+                      # Display the full response as markdown
+                      display(Markdown(reply))
+
+                      # Extract and execute code blocks
+                      code_blocks = re.findall(r'```python\n(.*?)```', reply, re.DOTALL)
+                      if code_blocks:
+                          combined = "\n\n".join(code_blocks)
+                          print("\n--- Executing code ---")
+                          self.shell.run_cell(combined)
+              MAGICPYEOF
+
+              chown -R ec2-user:ec2-user /home/ec2-user/SageMaker/claude_magic
+
+              # Create demo notebook with %%claude magic pre-loaded
+              cat > /home/ec2-user/SageMaker/claude_demo.ipynb << 'NBEOF'
+              {
+               "cells": [
+                {
+                 "cell_type": "markdown",
+                 "metadata": {},
+                 "source": ["# Claude AI Assistant Demo\n", "Use `%%claude` magic to interact with Claude Opus 4.6 via Bedrock.\n", "Claude will generate and execute code directly in this notebook."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%load_ext claude_magic"]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Load the Titanic dataset from ./data/titanic.csv with pandas. Show the first 10 rows, shape, and column types."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Generate summary statistics and create visualizations showing the distribution of Age, Fare, Pclass, and Survived. Save plots to plots/exploration.png."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Analyze missing values in the dataset. Show which columns have missing data, percentage missing, and suggest imputation strategies."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Suggest and implement feature transformations - extract titles from names, create family size, encode categoricals. Save processed data to data/titanic_processed.csv."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Train a Random Forest classifier using a SageMaker Training Job on a separate ml.m5.large instance. Upload the processed data to S3, create a training script, launch the job, and stream the logs. Print training accuracy when done."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Download the trained model artifact from S3 (from the training job in the previous step). Load it locally, run predictions on the test set, and evaluate with classification metrics and a confusion matrix. Save the confusion matrix plot to plots/confusion_matrix.png."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Suggest and implement hyperparameter tuning with GridSearchCV. Compare tuned vs baseline performance."]
+                },
+                {
+                 "cell_type": "code",
+                 "execution_count": null,
+                 "metadata": {},
+                 "outputs": [],
+                 "source": ["%%claude\n", "Build the final production-ready model using the best hyperparameters. Save it as a serialized artifact using joblib to models/titanic_model.joblib. Also save the preprocessing pipeline so the model can be loaded and used for inference on new data. Print a summary of the final model's performance."]
+                }
+               ],
+               "metadata": {
+                "kernelspec": {
+                 "display_name": "Python 3",
+                 "language": "python",
+                 "name": "python3"
+                }
+               },
+               "nbformat": 4,
+               "nbformat_minor": 4
+              }
+              NBEOF
+              chown ec2-user:ec2-user /home/ec2-user/SageMaker/claude_demo.ipynb
+
+              # Create setup script for Claude Code CLI (run manually — Option B)
+              cat > /home/ec2-user/SageMaker/setup_claude_cli.sh << 'SETUPEOF'
+              #!/bin/bash
+              set -e
+              echo "Installing Node.js via nvm..."
+              export NVM_DIR="$HOME/.nvm"
+              curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+              source "$NVM_DIR/nvm.sh"
+              nvm install 18
+              nvm use 18
+              nvm alias default 18
+              echo "Installing Claude Code..."
+              npm install -g @anthropic-ai/claude-code
+              echo "Configuring Claude Code for Bedrock Opus 4.6..."
+              cat > ~/.claude_code_env << 'ENVEOF'
+              export CLAUDE_CODE_USE_BEDROCK=1
+              export AWS_REGION=${BedrockRegion}
+              export ANTHROPIC_DEFAULT_OPUS_MODEL="us.anthropic.claude-opus-4-6-v1"
+              export ANTHROPIC_DEFAULT_HAIKU_MODEL="us.anthropic.claude-haiku-4-5-20251001-v1:0"
+              export NVM_DIR="$HOME/.nvm"
+              [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+              ENVEOF
+              echo 'source ~/.claude_code_env' >> ~/.bashrc
+              source ~/.claude_code_env
+              echo "Done! Run 'claude' to start."
+              SETUPEOF
+              chmod +x /home/ec2-user/SageMaker/setup_claude_cli.sh
+              chown ec2-user:ec2-user /home/ec2-user/SageMaker/setup_claude_cli.sh
+
+              echo "OnCreate: dataset downloaded, SDK installed, magic + notebook created, CLI setup script ready."
+
+  NotebookInstance:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: !Sub '${AWS::StackName}-notebook'
+      InstanceType: !Ref NotebookInstanceType
+      RoleArn: !GetAtt NotebookRole.Arn
+      VolumeSizeInGB: !Ref VolumeSizeGB
+      DirectInternetAccess: Enabled
+      PlatformIdentifier: notebook-al2023-v1
+      LifecycleConfigName: !GetAtt NotebookLifecycleConfig.NotebookInstanceLifecycleConfigName
+
+Outputs:
+  NotebookInstanceUrl:
+    Description: URL to access the SageMaker notebook instance
+    Value: !Sub 'https://${NotebookInstance.NotebookInstanceName}.notebook.${AWS::Region}.sagemaker.aws/tree'
+
+  NotebookInstanceName:
+    Description: Name of the SageMaker notebook instance
+    Value: !GetAtt NotebookInstance.NotebookInstanceName
+
+  DemoInstructions:
+    Description: How to start the demo
+    Value: 'Option A (Notebook): Open claude_demo.ipynb and run cells. Option B (CLI): Terminal -> cd SageMaker -> bash setup_claude_cli.sh -> claude'
