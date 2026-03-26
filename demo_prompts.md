@@ -2,6 +2,14 @@
 
 Open JupyterLab Terminal → `cd SageMaker` → `claude`
 
+```
+bash setup_claude_cli.sh
+```
+```
+source ~/.bashrc
+claude
+```
+
 Then use these prompts in order:
 
 ## Step 1: Data Loading
